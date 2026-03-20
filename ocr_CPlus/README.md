@@ -1,6 +1,6 @@
 # OCR Gatekeeper – C++ Version (`ocr_CPlus`)
 
-Diese Version bildet die Kernlogik aus `main.py` in C++ nach und enthält jetzt ein **IBML-Scanner-Profil**.
+Diese Version bildet die Kernlogik aus `main.py` in C++ nach, inklusive **IBML-Scanner-Profil** sowie **API + Dashboard**.
 
 ## Was ist umgesetzt?
 
@@ -12,6 +12,10 @@ Diese Version bildet die Kernlogik aus `main.py` in C++ nach und enthält jetzt 
 - Scanner-Profile:
   - `generic` (Default)
   - `ibml` (für IBML-Scans optimierte Vorverarbeitung + strengere Qualitätsgrenze)
+- HTTP-API + Live-Dashboard:
+  - `GET /`
+  - `GET /status`
+  - `POST /scan`
 
 ## Voraussetzungen
 
@@ -29,12 +33,29 @@ cmake -S . -B build
 cmake --build build -j
 ```
 
-## Ausführen
-
-Lege Eingabedateien in `scan_input/` (im Repo-Root) und starte:
+## Batch-Modus (einmalige Verarbeitung)
 
 ```bash
 ./ocr_CPlus/build/ocr_gatekeeper_cpp
+```
+
+## API + Dashboard starten
+
+```bash
+export OCR_ENABLE_API=1
+export OCR_API_PORT=8000
+./ocr_CPlus/build/ocr_gatekeeper_cpp
+```
+
+Dann im Browser öffnen:
+
+- `http://localhost:8000/` (Dashboard)
+- `http://localhost:8000/status` (JSON-Status)
+
+Manuell einen Scan-Lauf starten:
+
+```bash
+curl -X POST http://localhost:8000/scan
 ```
 
 ## IBML-Anpassung aktivieren
@@ -42,6 +63,7 @@ Lege Eingabedateien in `scan_input/` (im Repo-Root) und starte:
 ```bash
 export OCR_PROFILE=ibml
 export OCR_LANG=deu
+export OCR_ENABLE_API=1
 ./ocr_CPlus/build/ocr_gatekeeper_cpp
 ```
 
@@ -52,9 +74,11 @@ export OCR_LANG=deu
 - `OCR_INPUT_DIR`
 - `OCR_OUTPUT_DIR`
 - `OCR_REJECT_DIR`
+- `OCR_ENABLE_API=0|1`
+- `OCR_API_HOST` (aktuell nur Anzeigezweck)
+- `OCR_API_PORT`
 
 ## Hinweise
 
-- Die ursprüngliche Python-Version enthält zusätzlich FastAPI + Dashboard.
-- Diese C++-Version konzentriert sich auf den Verarbeitungskern (Queue/Pipeline/OCR/Retry).
+- Diese C++-Version enthält jetzt ebenfalls API + Dashboard, analog zur Python-Variante.
 - Bei `OCR_PROFILE=ibml` werden u. a. stärkere Binarisierung, Denoising, Deskew-Versuch sowie erhöhte Qualitätsanforderung (`min_score=0.62`) verwendet.

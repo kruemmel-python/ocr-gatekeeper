@@ -7,6 +7,7 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 
 find_package(OpenCV REQUIRED)
 find_package(PkgConfig REQUIRED)
+find_package(Threads REQUIRED)
 pkg_check_modules(TESSERACT REQUIRED tesseract)
 
 add_executable(ocr_gatekeeper_cpp src/main.cpp)
@@ -19,6 +20,7 @@ target_include_directories(ocr_gatekeeper_cpp PRIVATE
 target_link_libraries(ocr_gatekeeper_cpp PRIVATE
     ${OpenCV_LIBS}
     ${TESSERACT_LIBRARIES}
+    Threads::Threads
 )
 
 target_compile_options(ocr_gatekeeper_cpp PRIVATE

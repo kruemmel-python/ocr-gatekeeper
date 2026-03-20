@@ -19,6 +19,11 @@
 #include <thread>
 #include <vector>
 
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <unistd.h>
+
 namespace fs = std::filesystem;
 
 enum class ScannerProfile {
@@ -34,6 +39,11 @@ struct Config {
                                             : 1u);
     std::string language = "eng";
     ScannerProfile scanner_profile = ScannerProfile::Generic;
+
+    bool enable_api = false;
+    std::string api_host = "0.0.0.0";
+    int api_port = 8000;
+
     fs::path input_dir = "scan_input";
     fs::path output_dir = "scan_output";
     fs::path reject_dir = "scan_reject";
@@ -103,7 +113,8 @@ public:
         fs::create_directories(config_.reject_dir);
     }
 
-    void enqueue_scan_input() {
+    int enqueue_scan_input() {
+        int enqueued = 0;
         for (const auto& entry : fs::directory_iterator(config_.input_dir)) {
             if (!entry.is_regular_file() || !is_supported_extension(entry.path())) {
                 continue;
@@ -111,27 +122,94 @@ public:
 
             queue_.push(Job{entry.path()});
             pending_.fetch_add(1);
+            ++enqueued;
+        }
+        return enqueued;
+    }
+
+    void start_workers() {
+        for (unsigned int i = 0; i < config_.workers; ++i) {
+            workers_.emplace_back([this] { worker_loop(); });
         }
     }
 
-    void run() {
-        start_workers();
-
+    void run_until_idle() {
         while (pending_.load() > 0 || !queue_.empty()) {
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
         }
+    }
 
+    void shutdown() {
         queue_.stop();
         for (auto& t : workers_) {
             if (t.joinable()) {
                 t.join();
             }
         }
+    }
 
-        print_stats();
+    std::string status_json() {
+        std::lock_guard<std::mutex> lock(stats_mutex_);
+        std::ostringstream out;
+        out << "{\"processed\":" << stats_.processed
+            << ",\"ok\":" << stats_.ok
+            << ",\"retry\":" << stats_.retry
+            << ",\"reject\":" << stats_.reject
+            << ",\"last_files\":[";
+
+        for (size_t i = 0; i < stats_.last_files.size(); ++i) {
+            if (i > 0) out << ',';
+            out << '"' << escape_json(stats_.last_files[i]) << '"';
+        }
+        out << "]}";
+        return out.str();
+    }
+
+    std::string dashboard_html() {
+        std::lock_guard<std::mutex> lock(stats_mutex_);
+
+        std::ostringstream files;
+        for (const auto& f : stats_.last_files) {
+            files << f << "<br>";
+        }
+
+        std::ostringstream html;
+        html << "<!DOCTYPE html><html><head><meta charset='UTF-8'>"
+             << "<title>Scan Pipeline Dashboard</title>"
+             << "<meta http-equiv='refresh' content='2'>"
+             << "<style>body{font-family:Arial;background:#111;color:#eee;margin:24px;}"
+             << ".card{padding:16px;margin:8px 0;background:#222;border-radius:8px;}"
+             << "button{padding:10px 14px;background:#0a84ff;color:#fff;border:0;border-radius:6px;cursor:pointer;}"
+             << "</style></head><body>"
+             << "<h1>📄 OCR Gatekeeper Dashboard (C++)</h1>"
+             << "<form method='post' action='/scan'><button type='submit'>Scan starten</button></form>"
+             << "<div class='card'>Processed: " << stats_.processed << "</div>"
+             << "<div class='card'>OK: " << stats_.ok << "</div>"
+             << "<div class='card'>Retry: " << stats_.retry << "</div>"
+             << "<div class='card'>Reject: " << stats_.reject << "</div>"
+             << "<h2>Last Files</h2><div class='card'>" << files.str() << "</div>"
+             << "</body></html>";
+
+        return html.str();
     }
 
 private:
+    static std::string escape_json(const std::string& in) {
+        std::string out;
+        out.reserve(in.size());
+        for (char c : in) {
+            switch (c) {
+                case '"': out += "\\\""; break;
+                case '\\': out += "\\\\"; break;
+                case '\n': out += "\\n"; break;
+                case '\r': out += "\\r"; break;
+                case '\t': out += "\\t"; break;
+                default: out += c; break;
+            }
+        }
+        return out;
+    }
+
     static bool is_supported_extension(const fs::path& path) {
         static const std::vector<std::string> allowed = {
             ".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff"
@@ -378,24 +456,6 @@ private:
         }
     }
 
-    void start_workers() {
-        for (unsigned int i = 0; i < config_.workers; ++i) {
-            workers_.emplace_back([this] { worker_loop(); });
-        }
-    }
-
-    void print_stats() {
-        std::lock_guard<std::mutex> lock(stats_mutex_);
-        std::cout << "Processed: " << stats_.processed << '\n';
-        std::cout << "OK:        " << stats_.ok << '\n';
-        std::cout << "Retry:     " << stats_.retry << '\n';
-        std::cout << "Reject:    " << stats_.reject << '\n';
-        std::cout << "Last files:" << '\n';
-        for (const auto& f : stats_.last_files) {
-            std::cout << "  - " << f << '\n';
-        }
-    }
-
 private:
     Config config_;
     JobQueue queue_;
@@ -405,11 +465,111 @@ private:
     std::atomic<int> pending_{0};
 };
 
+class SimpleHttpServer {
+public:
+    SimpleHttpServer(OcrGatekeeper& gatekeeper, Config config)
+        : gatekeeper_(gatekeeper), config_(std::move(config)) {}
+
+    void run() {
+        int server_fd = socket(AF_INET, SOCK_STREAM, 0);
+        if (server_fd < 0) {
+            std::cerr << "Could not create server socket\n";
+            return;
+        }
+
+        int opt = 1;
+        setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+
+        sockaddr_in addr{};
+        addr.sin_family = AF_INET;
+        addr.sin_port = htons(static_cast<uint16_t>(config_.api_port));
+        addr.sin_addr.s_addr = INADDR_ANY;
+
+        if (bind(server_fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) < 0) {
+            std::cerr << "Bind failed on port " << config_.api_port << '\n';
+            close(server_fd);
+            return;
+        }
+
+        if (listen(server_fd, 16) < 0) {
+            std::cerr << "Listen failed\n";
+            close(server_fd);
+            return;
+        }
+
+        std::cout << "Dashboard/API running on http://" << config_.api_host << ':' << config_.api_port << '\n';
+
+        while (true) {
+            int client_fd = accept(server_fd, nullptr, nullptr);
+            if (client_fd < 0) {
+                continue;
+            }
+            std::thread(&SimpleHttpServer::handle_client, this, client_fd).detach();
+        }
+    }
+
+private:
+    static std::string make_response(const std::string& body, const std::string& content_type, int status,
+                                     const std::string& status_text) {
+        std::ostringstream out;
+        out << "HTTP/1.1 " << status << ' ' << status_text << "\r\n"
+            << "Content-Type: " << content_type << "\r\n"
+            << "Content-Length: " << body.size() << "\r\n"
+            << "Connection: close\r\n\r\n"
+            << body;
+        return out.str();
+    }
+
+    void handle_client(int client_fd) {
+        std::string request;
+        request.resize(8192);
+        ssize_t bytes = recv(client_fd, request.data(), request.size(), 0);
+        if (bytes <= 0) {
+            close(client_fd);
+            return;
+        }
+        request.resize(static_cast<size_t>(bytes));
+
+        std::istringstream in(request);
+        std::string method;
+        std::string path;
+        std::string version;
+        in >> method >> path >> version;
+
+        std::string response;
+        if (method == "GET" && path == "/status") {
+            response = make_response(gatekeeper_.status_json(), "application/json; charset=utf-8", 200, "OK");
+        } else if (method == "POST" && path == "/scan") {
+            int count = gatekeeper_.enqueue_scan_input();
+            std::ostringstream body;
+            body << "{\"message\":\"Jobs added\",\"count\":" << count << '}';
+            response = make_response(body.str(), "application/json; charset=utf-8", 200, "OK");
+        } else if (method == "GET" && path == "/") {
+            response = make_response(gatekeeper_.dashboard_html(), "text/html; charset=utf-8", 200, "OK");
+        } else {
+            response = make_response("Not Found", "text/plain; charset=utf-8", 404, "Not Found");
+        }
+
+        send(client_fd, response.c_str(), response.size(), 0);
+        close(client_fd);
+    }
+
+    OcrGatekeeper& gatekeeper_;
+    Config config_;
+};
+
 static ScannerProfile parse_profile(const std::string& value) {
     if (value == "ibml" || value == "IBML") {
         return ScannerProfile::Ibml;
     }
     return ScannerProfile::Generic;
+}
+
+static bool parse_bool(const char* value) {
+    if (!value) return false;
+    std::string v = value;
+    std::transform(v.begin(), v.end(), v.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    return v == "1" || v == "true" || v == "yes" || v == "on";
 }
 
 static Config load_config_from_env() {
@@ -430,6 +590,15 @@ static Config load_config_from_env() {
     if (const char* rej = std::getenv("OCR_REJECT_DIR")) {
         cfg.reject_dir = rej;
     }
+    if (const char* enable_api = std::getenv("OCR_ENABLE_API")) {
+        cfg.enable_api = parse_bool(enable_api);
+    }
+    if (const char* api_port = std::getenv("OCR_API_PORT")) {
+        cfg.api_port = std::max(1, std::atoi(api_port));
+    }
+    if (const char* api_host = std::getenv("OCR_API_HOST")) {
+        cfg.api_host = api_host;
+    }
 
     if (cfg.scanner_profile == ScannerProfile::Ibml) {
         cfg.min_score = 0.62;
@@ -448,8 +617,19 @@ int main() {
     }
 
     OcrGatekeeper gatekeeper(config);
+    gatekeeper.start_workers();
+
+    if (config.enable_api) {
+        SimpleHttpServer server(gatekeeper, config);
+        server.run();
+        gatekeeper.shutdown();
+        return 0;
+    }
+
     gatekeeper.enqueue_scan_input();
-    gatekeeper.run();
+    gatekeeper.run_until_idle();
+    gatekeeper.shutdown();
+    std::cout << gatekeeper.status_json() << '\n';
 
     return 0;
 }
